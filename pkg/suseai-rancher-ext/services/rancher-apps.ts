@@ -1,0 +1,1228 @@
+import yaml from 'js-yaml';
+
+// Utility function to deep merge objects (for combining chart defaults with user values)
+function deepMerge(target: Record<string, any>, source: Record<string, any>): Record<string, any> {
+  const result = { ...target };
+
+  for (const key in source) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key]) &&
+          result[key] && typeof result[key] === 'object' && !Array.isArray(result[key])) {
+        // Recursively merge objects
+        result[key] = deepMerge(result[key], source[key]);
+      } else {
+        // Override with source value (including arrays and primitives)
+        result[key] = source[key];
+      }
+    }
+  }
+
+  return result;
+}
+import { log as logger } from '../utils/logger';
+import { createChartValuesService } from './chart-values';
+import { createErrorHandler } from '../utils/error-handler';
+import type {
+  RancherStore,
+  ClusterInfo,
+  ClusterResource,
+  NamespaceResource,
+  HelmSecret,
+  HelmConfigMap,
+  HelmReleaseInfo,
+  HelmInstallationDetails,
+  AppCRD,
+  RegistrySecret,
+  RepositoryIndex,
+  FileEntry,
+  RancherError,
+  ListResponse,
+  InstallationPayload,
+  ProjectResource,
+  ServiceAccount,
+  isRancherError
+} from '../types/rancher-types';
+
+export interface ChartRef {
+  repoName: string;   // ClusterRepo metadata.name
+  chartName: string;  // Chart name within repo
+  version: string;    // SemVer
+}
+
+/* ============================== logging helpers - CLEANED UP ============================== */
+// Legacy logging functions - replaced with proper logger
+const log = (l: string, ...a: unknown[]) => {
+  logger.debug(l, { component: 'RancherApps', data: a.length > 0 ? a : undefined });
+};
+const dbg = (label: string, obj: unknown) => {
+  logger.debug(label, {
+    component: 'RancherApps',
+    data: {
+      type: typeof obj,
+      isArray: Array.isArray(obj),
+      keys: obj && typeof obj === 'object' && obj !== null ? Object.keys(obj).slice(0, 25) : []
+    }
+  });
+};
+
+/* ============================== name matching =============================== */
+
+function normName(s?: string): string {
+  return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+function sameName(a?: string, b?: string): boolean {
+  return !!a && !!b && normName(a) === normName(b);
+}
+function matchesSlug(name: string, slug: string, guess?: string): boolean {
+  return sameName(name, slug) || (guess ? sameName(name, guess) : false);
+}
+
+/* ===================== cluster + Rancher App basic helpers ==================== */
+
+export async function getClusters($store: RancherStore): Promise<ClusterInfo[]> {
+  try {
+    const rows = await $store.dispatch('management/findAll', { type: 'cluster' });
+    return (rows || []).map((c: ClusterResource) => ({ id: c.id, name: c.metadata?.name || c.id }));
+  } catch {
+    const res = await $store.dispatch('rancher/request', { url: '/v1/management.cattle.io.clusters?limit=2000' });
+    const items = res?.data?.data || res?.data || [];
+    return (items || []).map((c: ClusterResource) => ({
+      id:   c?.metadata?.name || c?.id,
+      name: c?.metadata?.name || c?.id
+    })).filter((x: ClusterInfo) => !!x.id);
+  }
+}
+
+export async function ensureNamespace($store: RancherStore, clusterId: string, namespace: string): Promise<void> {
+  const getUrl = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(namespace)}`;
+  try {
+    await $store.dispatch('rancher/request', { url: getUrl });
+  } catch {
+    const createUrl = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces`;
+    await $store.dispatch('rancher/request', {
+      url: createUrl,
+      method: 'POST',
+      data: { apiVersion: 'v1', kind: 'Namespace', metadata: { name: namespace } }
+    });
+  }
+}
+
+export async function appExists($store: RancherStore, clusterId: string, namespace: string, release: string): Promise<boolean> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/apis/catalog.cattle.io/v1/namespaces/${encodeURIComponent(namespace)}/apps/${encodeURIComponent(release)}`;
+  try {
+    await $store.dispatch('rancher/request', { url });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function createOrUpgradeApp(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  releaseName: string,
+  chart: { repoName: string; chartName: string; version: string },
+  values: Record<string, unknown>,
+  preferredAction: 'install' | 'upgrade' = 'install'
+) {
+  const log = (l: string, ...a: unknown[]) => { try { console.log(`[SUSE-AI-INSTALL] ${l}`, ...a); } catch {} };
+
+  log('=== Starting createOrUpgradeApp ===');
+  log('Input parameters:', { 
+    clusterId, 
+    namespace, 
+    releaseName, 
+    chart: chart,
+    preferredAction,
+    valuesKeys: Object.keys(values || {}),
+    valuesSize: JSON.stringify(values || {}).length 
+  });
+
+  const clusterReposUrl = `/k8s/clusters/${encodeURIComponent(clusterId)}/v1/catalog.cattle.io.clusterrepos/${chart.repoName}?action=${preferredAction}`;
+  const appsUrl = `/k8s/clusters/${encodeURIComponent(clusterId)}/apis/catalog.cattle.io/v1/namespaces/${encodeURIComponent(namespace)}/apps`;
+  const appUrl = `${appsUrl}/${encodeURIComponent(releaseName)}`;
+
+  log('URLs constructed:', { clusterReposUrl, appsUrl, appUrl });
+
+  log('Fetching projects for cluster...', clusterId);
+  try {
+    const projects = await $store.dispatch('rancher/findAll', {
+      type: 'project',
+      opt: { url: `/v3/clusters/${clusterId}/projects` }
+    });
+    
+    const projectId = projects[0].clusterId;
+    log('Using projectId:', projectId);
+    
+    const charts = [
+      {
+        chartName: chart.chartName,
+        version: chart.version,
+        releaseName,
+        annotations: {
+          'catalog.cattle.io/ui-source-repo-type': 'cluster',
+          'catalog.cattle.io/ui-source-repo': chart.repoName
+        },
+        values
+      }
+    ];
+    log('Charts array prepared:', charts);
+
+    const appPayload = {
+      apiVersion: 'catalog.cattle.io/v1',
+      kind:       'App',
+      metadata:   {
+        namespace,
+        name:   releaseName,
+        labels: { 'catalog.cattle.io/cluster-repo-name': chart.repoName },
+        resourceVersion: undefined as string | undefined
+      },
+      spec: {
+        chart: {
+          metadata: {
+            name:    chart.chartName,
+            version: chart.version,
+          }
+        },
+        name:      releaseName,
+        namespace: namespace,
+        values,
+      },
+    };
+
+    // For upgrade actions, use the clusterRepo action directly instead of trying PUT
+    if (preferredAction === 'upgrade') {
+      log('Performing upgrade via clusterRepo action');
+      const upgradeData = {
+        charts,
+        namespace,
+        projectId,
+        wait: true,
+        timeout: '600s',
+        noHooks: false,
+        disableOpenAPIValidation: false,
+        skipCRDs: false
+      };
+      
+      try {
+        log('Dispatching upgrade request...', { url: clusterReposUrl, data: upgradeData });
+        const upgradeResult = await $store.dispatch('rancher/request', {
+          method: 'post',
+          url: clusterReposUrl,
+          data: upgradeData
+        });
+        log('App upgrade successful. Result:', upgradeResult);
+        log('=== Completed createOrUpgradeApp (upgrade) ===');
+        return;
+      } catch (upgradeError: unknown) {
+        const errorHandler = createErrorHandler($store, 'RancherApps');
+        const standardError = errorHandler.handleApiError(upgradeError, 'upgrade', { releaseName, namespace });
+        throw new Error(`Failed to upgrade app: ${standardError.message}`);
+      }
+    }
+
+    // For install actions, check if app exists first and use PUT if it does
+    try {
+      log('Checking for existing App...', { namespace, releaseName, checkUrl: appUrl });
+      const existing = await $store.dispatch('rancher/request', { url: appUrl });
+      // Extract resourceVersion for app update
+      const resourceVersion = existing?.data?.metadata?.resourceVersion
+                           || existing?.metadata?.resourceVersion;
+
+      if (resourceVersion) {
+        log('App exists, performing upgrade (PUT)', { resourceVersion });
+        appPayload.metadata.resourceVersion = resourceVersion;
+        const upgradeResult = await $store.dispatch('rancher/request', {
+          url:    appUrl,
+          method: 'PUT',
+          data:   appPayload,
+        });
+        log('App upgrade successful. Result:', upgradeResult);
+      } else {
+        log('ERROR: App exists but could not retrieve resourceVersion from any path');
+        log('Full existing object structure:', JSON.stringify(existing, null, 2));
+        throw new Error('App exists but could not retrieve resourceVersion.');
+      }
+    } catch (e: unknown) {
+      log('Exception during app check/upgrade:', { 
+        error: e,
+        status: statusOf(e),
+        message: getErrorMessage(e),
+        dataMessage: (getErrorData(e) as { message?: string })?.message,
+        responseData: getErrorData(e) 
+      });
+      
+      const status = statusOf(e);
+      if (status === 404) {
+        log('App does not exist (404), performing install (POST)');
+        
+        const installData = {
+          charts,
+          namespace,
+          projectId,
+          wait: true,
+          timeout: '600s',
+          noHooks: false,
+          disableOpenAPIValidation: false,
+          skipCRDs: false
+        };
+        
+        try {
+          const installResult = await $store.dispatch('rancher/request', {
+            method: 'post',
+            url: clusterReposUrl,
+            data: installData
+          });
+          log('App install successful');
+        } catch (installError: unknown) {
+          const errorHandler = createErrorHandler($store, 'RancherApps');
+          const standardError = errorHandler.handleApiError(installError, 'install', { releaseName, namespace });
+          throw new Error(`Failed to install app: ${standardError.message}`);
+        }
+      } else {
+        const errorHandler = createErrorHandler($store, 'RancherApps');
+        const standardError = errorHandler.handleApiError(e, 'install', { releaseName, namespace, status });
+        throw new Error(`Failed to install/upgrade app: ${standardError.message}`);
+      }
+    }
+  } catch (projectError: unknown) {
+    const errorHandler = createErrorHandler($store, 'RancherApps');
+    const standardError = errorHandler.handleApiError(projectError, 'fetch', { operation: 'fetch projects' });
+    throw new Error(`Failed to fetch projects: ${standardError.message}`);
+  }
+  
+  log('=== Completed createOrUpgradeApp ===');
+}
+
+/* ====================== verify app appears and becomes ready ===================== */
+
+export async function waitForAppInstall(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  releaseName: string,
+  timeoutMs = 90_000
+): Promise<AppCRD> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/apis/catalog.cattle.io/v1/namespaces/${encodeURIComponent(namespace)}/apps/${encodeURIComponent(releaseName)}`;
+  const start = Date.now();
+  let lastErr: unknown = null;
+
+  log('post-install: wait for App to appear', { clusterId, namespace, releaseName, timeoutMs });
+
+  for (;;) {
+    try {
+      const r = await $store.dispatch('rancher/request', { url });
+      const app = (r?.data ?? r) || {};
+      const gen = app?.metadata?.generation ?? 0;
+      const obs = app?.status?.observedGeneration ?? 0;
+      const sum = app?.status?.summary || {};
+      const state = sum?.state || app?.status?.conditions?.find((c: { type: string; status: string }) => c?.type === 'Ready')?.status || 'Unknown';
+
+      log('post-install: app peek', { gen, obs, state, ns: namespace, name: releaseName });
+      if (obs >= gen) return app; // observed the latest spec (good enough for us)
+    } catch (e: unknown) {
+      lastErr = e;
+      // keep polling on 404; bubble others
+      const code = statusOf(e);
+      if (code && code !== 404) {
+        log('post-install: early error (non-404)', code);
+      }
+    }
+
+    if (Date.now() - start > timeoutMs) {
+      const msg = getErrorMessage(lastErr) || (getErrorData(lastErr) as { message?: string })?.message || 'App did not appear in time';
+      throw new Error(msg);
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+}
+
+export async function deleteApp($store: RancherStore, clusterId: string, namespace: string, releaseName: string, repoName?: string): Promise<void> {
+  try {
+    const url =
+      `/k8s/clusters/${encodeURIComponent(clusterId)}` +
+      `/v1/catalog.cattle.io.apps/${encodeURIComponent(namespace)}/${encodeURIComponent(releaseName)}?action=uninstall`;
+
+    await $store.dispatch('rancher/request', {
+      url,
+      method: 'POST',
+      data: { timeout: '600s' }
+    });
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    log('App CRD deleted');
+  } catch (e: unknown) {
+    log('Failed to delete app:', getErrorMessage(e));
+    throw e;
+  }
+}
+
+/* ============================ discovery (manage) ============================ */
+
+export async function listCatalogApps($store: RancherStore, clusterId: string): Promise<AppCRD[]> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/apis/catalog.cattle.io/v1/apps?limit=1000`;
+  const res = await $store.dispatch('rancher/request', { url });
+  return res?.data?.items || res?.data || res?.items || [];
+}
+
+async function listNamespaces($store: RancherStore, clusterId: string): Promise<string[]> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces?limit=5000`;
+  const res = await $store.dispatch('rancher/request', { url });
+  const items = res?.data?.items || res?.data || [];
+  return (items || []).map((n: NamespaceResource) => n?.metadata?.name).filter((n: string) => !!n);
+}
+
+async function listNsHelmSecrets($store: RancherStore, clusterId: string, ns: string): Promise<HelmSecret[]> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(ns)}/secrets?labelSelector=owner%3Dhelm`;
+  const res = await $store.dispatch('rancher/request', { url });
+  return res?.data?.items || res?.data || [];
+}
+
+async function listNsHelmConfigMaps($store: RancherStore, clusterId: string, ns: string): Promise<HelmConfigMap[]> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(ns)}/configmaps?labelSelector=owner%3Dhelm`;
+  const res = await $store.dispatch('rancher/request', { url });
+  return res?.data?.items || res?.data || [];
+}
+
+function extractHelmRelease(obj: HelmSecret | HelmConfigMap): HelmReleaseInfo {
+  const meta = obj?.metadata || {};
+  const labels = meta?.labels || {};
+  const ann    = meta?.annotations || {};
+  const release  =
+        labels.name
+     || (meta?.name && (meta.name.match(/^sh\.helm\.release\.v1\.(.+)\.v\d+$/)?.[1]))
+     || labels['app.kubernetes.io/instance']
+     || ann['meta.helm.sh/release-name']
+     || '';
+  const chartLabel = labels.chart || ann['helm.sh/chart'] || '';
+  const chartBase  = chartLabel ? chartLabel.replace(/-\d+\.\d+\.\d+(?:[-+].*)?$/, '') : '';
+  const verMatch   = chartLabel.match(/-(\d+\.\d+\.\d+(?:[-+].*)?)$/);
+  const version    = verMatch ? verMatch[1] : '';
+  return { release, chartBase, version };
+}
+
+type FoundInfo = { release: string; namespace: string; chartName?: string; version?: string; clusters: string[] };
+
+export async function discoverExistingInstall(
+  $store: RancherStore,
+  slug: string,
+  chartNameGuess?: string,
+  preferClusterId?: string
+): Promise<FoundInfo | null> {
+  const clusters = await getClusters($store);
+  const order = [
+    ...(preferClusterId ? clusters.filter(c => c.id === preferClusterId) : []),
+    ...clusters.filter(c => !preferClusterId || c.id !== preferClusterId)
+  ];
+
+  let found: FoundInfo | null = null;
+
+  for (const c of order) {
+    // 1) Rancher Apps
+    try {
+      const apps = await listCatalogApps($store, c.id);
+      for (const a of apps) {
+        const meta  = a?.metadata || {};
+        const spec  = a?.spec || {};
+        const chart = spec?.chart?.metadata?.name || spec?.chartName || '';
+        const ver   = spec?.chart?.metadata?.version || spec?.version || '';
+        const rel   = meta?.name || '';
+        const ns    = meta?.namespace || '';
+
+        const hit = matchesSlug(chart, slug, chartNameGuess) || matchesSlug(rel, slug, chartNameGuess);
+        if (!hit) continue;
+
+        if (!found) found = { release: rel, namespace: ns, chartName: chart, version: ver, clusters: [c.id] };
+        else if (found.release === rel && found.namespace === ns) found.clusters.push(c.id);
+      }
+    } catch { /* ignore */ }
+    if (found) break;
+
+    // 2) Helm v3 storage per namespace
+    try {
+      const nss = await listNamespaces($store, c.id);
+      for (const ns of nss) {
+        const secs = await listNsHelmSecrets($store, c.id, ns);
+        let localFound: FoundInfo | null = found;
+        for (const s of secs) {
+          const { release, chartBase, version } = extractHelmRelease(s);
+          const hit = (release && matchesSlug(release, slug, chartNameGuess)) ||
+                      (chartBase && matchesSlug(chartBase, slug, chartNameGuess));
+          if (hit) {
+            if (!localFound) localFound = { release: release || slug, namespace: ns, chartName: chartBase || slug, version: version || '', clusters: [c.id] };
+            else if (localFound.release === release && localFound.namespace === ns) localFound.clusters.push(c.id);
+          }
+        }
+        if (!localFound) {
+          const cms = await listNsHelmConfigMaps($store, c.id, ns);
+          for (const cm of cms) {
+            const { release, chartBase, version } = extractHelmRelease(cm);
+            const hit = (release && matchesSlug(release, slug, chartNameGuess)) ||
+                        (chartBase && matchesSlug(chartBase, slug, chartNameGuess));
+            if (hit) {
+              if (!localFound) localFound = { release: release || slug, namespace: ns, chartName: chartBase || slug, version: version || '', clusters: [c.id] };
+              else if (localFound.release === release && localFound.namespace === ns) localFound.clusters.push(c.id);
+            }
+          }
+        }
+        if (localFound) { found = localFound; break; }
+      }
+    } catch { /* ignore */ }
+    if (found) break;
+  }
+
+  return found;
+}
+
+/* =========================== charts: index + versions =========================== */
+
+function uniqStr(arr: string[]): string[] { return Array.from(new Set(arr)); }
+function semverDesc(a: string, b: string): number {
+  const pa = a.split('.').map(n => parseInt(n, 10) || 0);
+  const pb = b.split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const da = pa[i] || 0; const db = pb[i] || 0;
+    if (da !== db) return db - da;
+  }
+  return b.localeCompare(a);
+}
+const SEMVER_CORE = /^\d+\.\d+\.\d+(\+up\d+\.\d+\.\d+)?$/; // show x.y.z or x.y.z+upA.B.C (Rancher chart format)
+
+async function getRepoIndexLink($store: RancherStore, repoName: string): Promise<string | null> {
+  try {
+    const repo = encodeURIComponent(repoName);
+    const url = `/v1/catalog.cattle.io.clusterrepos/${repo}`;
+    const res  = await $store.dispatch('rancher/request', { url });
+    const link = res?.data?.links?.index || res?.links?.index;
+    log('repo index link:', link);
+    return link || null;
+  } catch {
+    return null;
+  }
+}
+
+async function getRepoIndex($store: RancherStore, repoName: string): Promise<RepositoryIndex | null> {
+  const indexLink = await getRepoIndexLink($store, repoName);
+  if (!indexLink) return null;
+
+  const res = await $store.dispatch('rancher/request', { url: indexLink });
+  const payload = (res?.data ?? res);
+  dbg('index payload', payload);
+  if (typeof payload === 'string') return yaml.load(payload);
+  if (payload && typeof payload === 'object' && 'entries' in payload) return payload as RepositoryIndex;
+  if (payload && typeof payload === 'object' && 'data' in payload && payload.data && typeof payload.data === 'object' && 'entries' in payload.data) return payload.data as RepositoryIndex;
+  return null;
+}
+
+export async function findChartInRepo(
+  $store: RancherStore,
+  _repoClusterId: string,
+  repoName: string,
+  slug: string
+): Promise<{ chartName: string; version: string } | null> {
+  const index = await getRepoIndex($store, repoName);
+  const names = index?.entries ? Object.keys(index.entries) : [];
+  const match = names.find((n: string) => sameName(n, slug));
+  if (match && index) {
+    const vers = (index.entries[match] || []).map((v: { version: string }) => v.version).filter((v: string) => SEMVER_CORE.test(v));
+    const latest = uniqStr(vers).sort(semverDesc)[0];
+    if (latest) return { chartName: match, version: latest };
+  }
+  return null;
+}
+
+export async function listChartVersions(
+  $store: RancherStore,
+  _repoClusterId: string,
+  repoName: string,
+  chartName: string
+): Promise<string[]> {
+  const index = await getRepoIndex($store, repoName);
+  const names = index?.entries ? Object.keys(index.entries) : [];
+  const match = names.find((n: string) => sameName(n, chartName));
+  if (match && index) {
+    const out = uniqStr((index.entries[match] || []).map((v: { version: string }) => v.version))
+      .filter((v: string) => SEMVER_CORE.test(v))
+      .sort(semverDesc);
+    log('listChartVersions via index:', { chart: match, count: out.length });
+    return out;
+  }
+  return [];
+}
+
+/* ======================= values.yaml extraction (robust) ======================= */
+
+function decodeMaybeB64(s?: string): string {
+  if (!s || typeof s !== 'string') return '';
+  try {
+    const t = atob(s.replace(/\s+/g, ''));
+    if (/[:\n]/.test(t)) return t; // looks like YAML
+  } catch {}
+  return s;
+}
+function textFromFileEntry(v: FileEntry): string {
+  if (!v) return '';
+  if (typeof v === 'string') return decodeMaybeB64(v);
+  if (typeof v === 'object') {
+    const candidates = [v.content, v.contents, v.data, v.base64, v.value, v.Value, v.text];
+    for (const c of candidates) if (typeof c === 'string' && c) return decodeMaybeB64(c);
+  }
+  return '';
+}
+// Note: Complex file fetching functions removed - now handled by ChartValuesService
+
+export async function fetchChartDefaultValues(
+  $store: RancherStore,
+  _repoClusterId: string,
+  repoName: string,
+  chartName: string,
+  version: string
+): Promise<string> {
+  // Use simplified ChartValuesService instead of complex fallback chains
+  const chartValuesService = createChartValuesService($store);
+  return chartValuesService.getDefaultValues(repoName, chartName, version);
+}
+
+// Note: Complex tar.gz processing removed - now handled by ChartValuesService
+
+/* ================== NEW: helpers for repo discovery & helm installs ============== */
+
+async function listClusterRepos($store: RancherStore): Promise<ClusterResource[]> {
+  const res = await $store.dispatch('rancher/request', {
+    url: '/k8s/clusters/local/apis/catalog.cattle.io/v1/clusterrepos?limit=1000'
+  });
+  return res?.data?.items || res?.data || res?.items || [];
+}
+
+export async function inferClusterRepoForChart(
+  $store: RancherStore,
+  chartName: string,
+  preferVersion?: string
+): Promise<string | null> {
+  const repos = await listClusterRepos($store);
+  let best: string | null = null;
+
+  for (const r of repos) {
+    const name = r?.metadata?.name;
+    if (!name) continue;
+    try {
+      const index = await getRepoIndex($store, name);
+      const entries = index?.entries || {};
+      const foundKey = Object.keys(entries).find((k) => sameName(k, chartName));
+      if (!foundKey) continue;
+
+      if (preferVersion) {
+        const versions: string[] = (entries[foundKey] || []).map((e: { version: string }) => e?.version).filter(Boolean);
+        if (versions.includes(preferVersion)) return name; // perfect match
+      }
+      if (!best) best = name; // fallback: chart exists, version may differ
+    } catch { /* ignore this repo */ }
+  }
+  return best;
+}
+
+async function decodeHelmReleasePayload(b64: string): Promise<unknown | null> {
+  try {
+    // Simplified approach - try direct base64 decode first
+    const txt = atob(b64);
+    try { return JSON.parse(txt); } catch {}
+    try { return yaml.load(txt); } catch {}
+
+    // If direct decode fails, the data might be gzipped
+    // In production, Rancher should handle decompression server-side
+    console.warn('[SUSE-AI] Helm release payload appears to be compressed - consider using server-side decompression');
+    return null;
+  } catch (error) {
+    console.warn('[SUSE-AI] Failed to decode Helm release payload:', error);
+    return null;
+  }
+}
+
+async function findHelmReleaseObjects(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  releaseName: string
+): Promise<{ secret?: HelmSecret; configmap?: HelmConfigMap }> {
+  try {
+    // First try to find the latest version of the Helm release secret
+    // List all secrets to find the highest version number
+    try {
+      const url = `/v1/secrets?namespaceId=${encodeURIComponent(namespace)}&limit=1000`;
+      const response = await $store.dispatch('rancher/request', { url });
+      const secrets = response?.data || response?.items || response || [];
+
+      // Find all Helm release secrets for this release
+      const helmSecrets = secrets.filter((secret: HelmSecret) =>
+        secret.metadata?.name?.startsWith(`sh.helm.release.v1.${releaseName}.v`)
+      );
+
+      if (helmSecrets.length > 0) {
+        // Sort by version number (extract vN from the name)
+        const sortedSecrets = helmSecrets.sort((a: HelmSecret, b: HelmSecret) => {
+          const aVersion = parseInt(a.metadata.name.split('.v').pop() || '0');
+          const bVersion = parseInt(b.metadata.name.split('.v').pop() || '0');
+          return bVersion - aVersion; // Descending order (latest first)
+        });
+
+        const latestSecret = sortedSecrets[0];
+        const secretName = latestSecret.metadata.name;
+
+        console.log('[SUSE-AI DEBUG] Found Helm release versions:', helmSecrets.map((s: HelmSecret) => s.metadata.name));
+        console.log('[SUSE-AI DEBUG] Using latest version:', secretName);
+
+        // Now fetch the latest secret with includeHelmData=true
+        const detailUrl = `/v1/secrets/${encodeURIComponent(namespace)}/${encodeURIComponent(secretName)}?exclude=metadata.managedFields&includeHelmData=true`;
+        const secret = await $store.dispatch('rancher/request', { url: detailUrl });
+        if (secret?.data?.release) {
+          console.log('[SUSE-AI] Found Helm secret with includeHelmData=true:', secretName);
+          return { secret };
+        }
+      }
+    } catch (e: unknown) {
+      console.log('[SUSE-AI] Failed to find latest Helm secret, trying fallback:', getErrorMessage(e));
+    }
+    
+    // Fallback to generic secret listing (original approach)
+    const secs = await listNsHelmSecrets($store, clusterId, namespace);
+    const candidates = secs.filter((s: HelmSecret) => {
+      const meta = s?.metadata || {};
+      const { release } = extractHelmRelease(s);
+      if (release && normName(release) === normName(releaseName)) return true;
+      const n = meta?.name || '';
+      return new RegExp(`^sh\\.helm\\.release\\.v1\\.${releaseName}\\.v\\d+$`).test(n);
+    });
+    candidates.sort((a: HelmSecret, b: HelmSecret) => (b?.metadata?.name || '').localeCompare(a?.metadata?.name || ''));
+    return { secret: candidates[0] };
+  } catch { /* ignore */ }
+  try {
+    const cms = await listNsHelmConfigMaps($store, clusterId, namespace);
+    const candidates = cms.filter((cm: HelmConfigMap) => {
+      const meta = cm?.metadata || {};
+      const { release } = extractHelmRelease(cm);
+      return release && normName(release) === normName(releaseName);
+    });
+    candidates.sort((a: HelmConfigMap, b: HelmConfigMap) => (b?.metadata?.name || '').localeCompare(a?.metadata?.name || ''));
+    return { configmap: candidates[0] };
+  } catch { /* ignore */ }
+  return {};
+}
+
+export async function getInstalledHelmDetails(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  releaseName: string
+): Promise<{ chartName: string; chartVersion: string; values: Record<string, unknown> }> {
+  const { secret, configmap } = await findHelmReleaseObjects($store, clusterId, namespace, releaseName);
+  const helmObject = secret || configmap;
+  const { chartBase, version } = helmObject ? extractHelmRelease(helmObject) : { chartBase: undefined, version: undefined };
+
+  let values: Record<string, unknown> = {};
+  
+  // First check if we have the Helm data directly (from includeHelmData=true)
+  if (secret?.data?.release && typeof secret.data.release === 'object' && 'config' in secret.data.release) {
+    const release = secret.data.release as {
+      values?: Record<string, unknown>;
+      config?: Record<string, unknown>;
+      chart?: { values?: Record<string, unknown> };
+      info?: Record<string, unknown>;
+    };
+
+    // Priority order for values retrieval:
+    // 1. release.values - User-provided values (what we want for "Manage" workflow)
+    // 2. release.config - Merged values (defaults + user values)
+    // 3. release.chart.values - Chart default values
+    console.log('[SUSE-AI DEBUG] Helm release data analysis:', {
+      hasReleaseValues: !!release.values,
+      releaseValuesKeys: Object.keys(release.values || {}),
+      hasReleaseConfig: !!release.config,
+      releaseConfigKeys: Object.keys(release.config || {}),
+      hasChartValues: !!release.chart?.values,
+      chartValuesKeys: Object.keys(release.chart?.values || {}),
+      chartValuesSample: release.chart?.values ? JSON.stringify(release.chart.values, null, 2).substring(0, 500) : null
+    });
+
+    // For Manage workflow, we want the complete values structure (defaults + customizations)
+    // This matches what native Rancher shows: full schema with applied values
+    if (release.chart?.values && Object.keys(release.chart.values).length > 0) {
+      // Start with chart defaults (complete structure)
+      values = JSON.parse(JSON.stringify(release.chart.values));
+
+      // Merge user customizations on top
+      if (release.config && Object.keys(release.config).length > 0) {
+        values = deepMerge(values, release.config);
+        console.log('[SUSE-AI DEBUG] Using merged chart defaults + user config (complete structure)');
+      } else if (release.values && Object.keys(release.values).length > 0) {
+        values = deepMerge(values, release.values);
+        console.log('[SUSE-AI DEBUG] Using merged chart defaults + user values (complete structure)');
+      } else {
+        console.log('[SUSE-AI DEBUG] Using chart defaults only (no user customizations)');
+      }
+    } else if (release.config && Object.keys(release.config).length > 0) {
+      // Fallback: use config if no chart defaults available
+      values = release.config;
+      console.log('[SUSE-AI DEBUG] Fallback: using release.config (partial structure)');
+    } else if (release.values && Object.keys(release.values).length > 0) {
+      // Fallback: use user values if nothing else available
+      values = release.values;
+      console.log('[SUSE-AI DEBUG] Fallback: using release.values (user-provided only)');
+    } else {
+      console.log('[SUSE-AI DEBUG] No values found in any location!');
+    }
+  } else {
+    // Fallback to decoding the blob (original approach)
+    const blob = secret?.data?.release;
+    if (blob) {
+      const decoded = await decodeHelmReleasePayload(blob);
+      const cfg = (decoded as { config?: unknown; values?: unknown; chart?: { values?: unknown } })?.config ||
+                  (decoded as { values?: unknown })?.values ||
+                  (decoded as { chart?: { values?: unknown } })?.chart?.values || null;
+      if (cfg && typeof cfg === 'object') values = cfg as Record<string, unknown>;
+    }
+  }
+
+  console.log('[SUSE-AI DEBUG] getInstalledHelmDetails returning:', {
+    chartName: chartBase || releaseName,
+    chartVersion: version || '',
+    valuesKeys: Object.keys(values),
+    valuesSize: JSON.stringify(values).length,
+    valuesSample: JSON.stringify(values, null, 2).substring(0, 300)
+  });
+
+  return {
+    chartName: chartBase || releaseName,
+    chartVersion: version || '',
+    values
+  };
+}
+
+/* ================== read installed App details for Manage ================== */
+
+const CLUSTER_REPO_NAME_LABEL = 'catalog.cattle.io/cluster-repo-name';
+
+export async function getCatalogApp(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  releaseName: string
+): Promise<AppCRD> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/apis/catalog.cattle.io/v1/namespaces/${encodeURIComponent(namespace)}/apps/${encodeURIComponent(releaseName)}`;
+  console.log('[SUSE-AI DEBUG] getCatalogApp URL:', url);
+
+  try {
+    const res = await $store.dispatch('rancher/request', { url });
+    const app = (res?.data ?? res) || {};
+    console.log('[SUSE-AI DEBUG] getCatalogApp result:', {
+      hasMetadata: !!app.metadata,
+      hasSpec: !!app.spec,
+      specKeys: Object.keys(app.spec || {}),
+      hasValues: !!app.spec?.values,
+      hasValuesYaml: !!app.spec?.valuesYaml,
+      valuesKeys: Object.keys(app.spec?.values || {}),
+      valuesYamlLength: (app.spec?.valuesYaml || '').length,
+      chartMetadata: app.spec?.chart?.metadata,
+      specSample: app.spec ? JSON.stringify(app.spec, null, 2).substring(0, 500) : null
+    });
+    return app;
+  } catch (error) {
+    console.log('[SUSE-AI DEBUG] getCatalogApp failed:', error);
+    throw error;
+  }
+}
+
+export async function getInstalledAppDetails(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  releaseName: string
+): Promise<{ repoName: string; chartName: string; chartVersion: string; values: Record<string, unknown> }> {
+  const app = await getCatalogApp($store, clusterId, namespace, releaseName);
+  const labels = app?.metadata?.labels || {};
+  const repoName = labels[CLUSTER_REPO_NAME_LABEL] || labels['catalog.cattle.io/repo-name'] || '';
+  const chartName = app?.spec?.chart?.metadata?.name || app?.spec?.chartName || '';
+  const chartVersion = app?.spec?.chart?.metadata?.version || app?.spec?.version || '';
+
+  let values: Record<string, unknown> = {};
+
+  // Priority order for Rancher App CRD values:
+  // 1. spec.values - Direct values object
+  // 2. spec.valuesYaml - YAML string values
+  // 3. spec.chart.values - Chart-level values
+  if (app?.spec?.values && typeof app.spec.values === 'object' && Object.keys(app.spec.values).length > 0) {
+    values = app.spec.values;
+  } else if (typeof app?.spec?.valuesYaml === 'string' && app.spec.valuesYaml.trim()) {
+    try {
+      const loaded = yaml.load(app.spec.valuesYaml);
+      if (loaded && typeof loaded === 'object' && Object.keys(loaded as Record<string, unknown>).length > 0) {
+        values = loaded as Record<string, unknown>;
+      }
+    } catch (e) {
+      // Log error but continue with fallback
+      console.warn('[SUSE-AI] Failed to parse valuesYaml:', e);
+    }
+  } else if (app?.spec?.chart?.values && typeof app.spec.chart.values === 'object' && Object.keys(app.spec.chart.values).length > 0) {
+    values = app.spec.chart.values;
+  }
+
+  console.log('[SUSE-AI DEBUG] getInstalledAppDetails returning:', {
+    repoName,
+    chartName,
+    chartVersion,
+    valuesKeys: Object.keys(values),
+    valuesSize: JSON.stringify(values).length
+  });
+
+  return { repoName, chartName, chartVersion, values };
+}
+
+/* ======================== image pull secret helpers ======================== */
+
+// helper: list secrets in a namespace (used to find already-created -dockercfg)
+async function listNsSecrets(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string
+): Promise<RegistrySecret[]> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(namespace)}/secrets?limit=5000`;
+  const res = await $store.dispatch('rancher/request', { url });
+  return (res?.data?.items || res?.data || []) as RegistrySecret[];
+}
+
+// robust status grabber (handles Steve/K8s errors)
+function statusOf(e: unknown): number | null {
+  if (!e || typeof e !== 'object') return null;
+  const obj = e as { code?: number; data?: { code?: number }; response?: { status?: number }; status?: number };
+  // Start with the most likely paths for numeric status codes
+  const code = obj?.code ?? obj?.data?.code ?? obj?.response?.status;
+  if (typeof code === 'number') {
+    return code;
+  }
+  // Fallback for other error shapes, but only if the value is a number
+  if (typeof obj?.status === 'number') {
+    return obj.status;
+  }
+  return null;
+}
+
+function getErrorMessage(e: unknown): string {
+  if (!e) return 'Unknown error';
+  if (typeof e === 'string') return e;
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'object' && 'message' in e && typeof (e as { message: unknown }).message === 'string') {
+    return (e as { message: string }).message;
+  }
+  return 'Unknown error';
+}
+
+function getErrorData(e: unknown): unknown {
+  if (!e || typeof e !== 'object') return undefined;
+  const obj = e as { data?: unknown; response?: { data?: unknown } };
+  return obj.data || obj.response?.data;
+}
+
+export async function ensureRegistrySecret(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  registryHost: string,
+  desiredName: string,
+  username: string,
+  password: string
+): Promise<string> {
+  const asB64 = (s: string) => (typeof btoa === 'function' ? btoa(s) : Buffer.from(s).toString('base64'));
+  const authB64 = asB64(`${username}:${password}`);
+
+  const dockerCfgB64 = asB64(JSON.stringify({
+    auths: {
+      [registryHost]: { auth: authB64, username, password }
+    }
+  }));
+
+  // Canonical base name like <clusterrepo-auth-xxxxx>-dockercfg
+  const base = /^clusterrepo-auth-/.test(desiredName)
+    ? `${desiredName}-dockercfg`
+    : (desiredName.endsWith('-dockercfg') ? desiredName : `${desiredName}-dockercfg`);
+
+  const baseUrl = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(namespace)}/secrets`;
+  const getUrl  = (n: string) => `${baseUrl}/${encodeURIComponent(n)}`;
+
+  log('ensureRegistrySecret begin ', { clusterId, namespace, registryHost, desiredName, candidates: [base] });
+
+  // 0) If an existing usable secret already exists with the base prefix, reuse it (avoid races)
+  try {
+    const all = await listNsSecrets($store, clusterId, namespace);
+    log('ensureRegistrySecret: List all secrets in the namespace', {secrets: [all]});
+    const match = all.find((s: RegistrySecret) => s?.metadata?.name?.startsWith(base) &&
+      s?.type === 'kubernetes.io/dockerconfigjson' &&
+      typeof s?.data?.['.dockerconfigjson'] === 'string' &&
+      s?.data?.['.dockerconfigjson']?.length > 0);
+
+    if (match?.metadata?.name) {
+      log('ensureRegistrySecret: reusing existing dockerconfigjson', { name: match.metadata.name });
+      return match.metadata.name;
+    }
+  } catch (e) {
+    log('ensureRegistrySecret: list secrets failed (continuing)', statusOf(e));
+  }
+
+  log('ensureRegistrySecret: No existing usable secret found');
+
+  // 1) Try the canonical base name first (create if missing; do NOT delete anything anymore)
+  try {
+    const cur = await $store.dispatch('rancher/request', { url: getUrl(base) })
+      .catch((e: unknown) => (statusOf(e) === 404 ? null : Promise.reject(e)));
+
+    if (cur) {
+      const s = (cur?.data ?? cur) || {};
+      if (s?.type === 'kubernetes.io/dockerconfigjson' && typeof s?.data?.['.dockerconfigjson'] === 'string') {
+        log('secret GET', `${base} → exists & usable`);
+        return base;
+      }
+      // wrong type → fall through to unique name to avoid fights with other controllers
+      log('secret GET', `${base} → exists but wrong type; will create unique`);
+    } else {
+      log('secret GET', `${base} → 404`);
+      // create canonical
+      log('secret create POST → ', { clusterId, namespace, name: base });
+      await $store.dispatch('rancher/request', {
+        url: baseUrl, method: 'POST',
+        data: {
+          apiVersion: 'v1',
+          kind: 'Secret',
+          metadata: { name: base, namespace },
+          type: 'kubernetes.io/dockerconfigjson',
+          data: { '.dockerconfigjson': dockerCfgB64 }
+        }
+      });
+      // Non-blocking readiness probe (best-effort)
+      try { await waitForSecretReady($store, clusterId, namespace, base, 10_000, true); } catch {}
+      return base;
+    }
+  } catch (e: unknown) {
+    log('secret create(base) failed (continuing with unique)', statusOf(e), getErrorMessage(e));
+  }
+
+  // 2) Create a unique name if base is unsuitable or managed by someone else
+  const unique = `${base}-${Math.random().toString(36).slice(2, 7)}`;
+  log('secret create POST → ', { clusterId, namespace, name: unique });
+  await $store.dispatch('rancher/request', {
+    url: baseUrl, method: 'POST',
+    data: {
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: { name: unique, namespace },
+      type: 'kubernetes.io/dockerconfigjson',
+      data: { '.dockerconfigjson': dockerCfgB64 }
+    }
+  });
+
+  try { await waitForSecretReady($store, clusterId, namespace, unique, 10_000, true); } catch (e: unknown) {
+    log('secret readiness timed out (continuing anyway)', { name: unique, err: getErrorMessage(e) || e });
+  }
+
+  return unique;
+}
+
+export async function listServiceAccounts(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string
+): Promise<string[]> {
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(namespace)}/serviceaccounts?limit=5000`;
+  const res = await $store.dispatch('rancher/request', { url });
+  const items = (res?.data?.items || res?.data || []) as ServiceAccount[];
+  return items.map(sa => sa?.metadata?.name).filter(Boolean);
+}
+
+export async function ensureServiceAccountPullSecret(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  saName: string,
+  secretName: string
+) {
+  const base = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(namespace)}/serviceaccounts`;
+  const url  = `${base}/${encodeURIComponent(saName)}`;
+
+  try {
+    const cur = await $store.dispatch('rancher/request', { url });
+    const sa  = (cur?.data ?? cur) || {};
+    const rv  = sa?.metadata?.resourceVersion;
+
+    const orig = Array.isArray(sa.imagePullSecrets) ? sa.imagePullSecrets.slice() : [];
+    const has  = orig.some((e: { name?: string }) => e?.name === secretName);
+    const next = has ? orig : [...orig, { name: secretName }];
+
+    await $store.dispatch('rancher/request', {
+      url, method: 'PUT',
+      data: {
+        apiVersion: 'v1',
+        kind: 'ServiceAccount',
+        metadata: { name: saName, namespace, resourceVersion: rv },
+        secrets: sa.secrets,
+        automountServiceAccountToken: sa.automountServiceAccountToken,
+        imagePullSecrets: next
+      }
+    });
+  } catch (e) {
+    try { console.warn('[SUSE-AI] could not update ServiceAccount imagePullSecrets', { namespace, saName, e }); } catch {}
+  }
+}
+
+export async function ensurePullSecretOnAllSAs(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  secretName: string
+) {
+  const sas = await listServiceAccounts($store, clusterId, namespace);
+  for (const saName of sas) {
+    try {
+      await ensureServiceAccountPullSecret($store, clusterId, namespace, saName, secretName);
+    } catch (e) {
+      try { console.warn('[SUSE-AI] SA attach failed', { namespace, saName, e }); } catch {}
+    }
+  }
+}
+
+export async function ensureRegistrySecretSimple(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  registryHost: string,
+  desiredName: string,
+  username: string,
+  password: string
+): Promise<string> {
+  logger.debug('Ensuring registry secret (simple)', {
+    component: 'RancherApps',
+    data: { clusterId, namespace, registryHost, desiredName }
+  });
+
+  // 1. Prepare secret data
+  const asB64 = (s: string) => (typeof btoa === 'function' ? btoa(s) : Buffer.from(s).toString('base64'));
+  const authB64 = asB64(`${username}:${password}`);
+  const dockerCfgB64 = asB64(JSON.stringify({
+    auths: {
+      [registryHost]: { auth: authB64, username, password }
+    }
+  }));
+
+  // 2. Define a predictable name based on the desiredName
+  const secretName = `suse-ai-pull-secret-${desiredName.replace(/[^a-z0-9-]/g, '-')}`;
+
+  logger.debug('Creating secret with predictable name', {
+    component: 'RancherApps',
+    data: { secretName }
+  });
+
+  const secretPayload = {
+    apiVersion: 'v1',
+    kind: 'Secret',
+    metadata: { name: secretName, namespace } as any,
+    type: 'kubernetes.io/dockerconfigjson',
+    data: { '.dockerconfigjson': dockerCfgB64 }
+  };
+
+  const baseUrl = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(namespace)}/secrets`;
+  const secretUrl = `${baseUrl}/${encodeURIComponent(secretName)}`;
+
+  try {
+    // 3. Try to get the existing secret to see if we need to update or create
+    const existing = await $store.dispatch('rancher/request', { url: secretUrl });
+    const resourceVersion = existing?.data?.metadata?.resourceVersion;
+
+    // 4. If it exists, update it (PUT)
+    logger.debug('Secret exists, updating', {
+      component: 'RancherApps',
+      data: { secretName }
+    });
+
+    if (resourceVersion) {
+      secretPayload.metadata.resourceVersion = resourceVersion;
+    }
+
+    await $store.dispatch('rancher/request', {
+      url: secretUrl,
+      method: 'PUT',
+      data: secretPayload
+    });
+
+    logger.info('Secret updated successfully', {
+      component: 'RancherApps',
+      data: { secretName }
+    });
+
+  } catch (e: any) {
+    const status = statusOf(e);
+    if (status === 404) {
+      // 5. If it doesn't exist (404), create it (POST)
+      logger.debug('Secret does not exist, creating', {
+        component: 'RancherApps',
+        data: { secretName }
+      });
+
+      await $store.dispatch('rancher/request', {
+        url: baseUrl,
+        method: 'POST',
+        data: secretPayload
+      });
+
+      logger.info('Secret created successfully', {
+        component: 'RancherApps',
+        data: { secretName }
+      });
+    } else if (status === 409) {
+      // Conflict on update means it was created in the meantime, or we don't have resourceVersion. This is fine.
+      logger.debug('Conflict updating secret, assuming up to date', {
+        component: 'RancherApps',
+        data: { secretName }
+      });
+    } else {
+      // 6. For any other error (e.g., conflict on update, permissions), re-throw it.
+      logger.error('Failed to ensure secret', e, {
+        component: 'RancherApps',
+        data: { secretName }
+      });
+      throw new Error(`Failed to create or update secret ${secretName}: ${e?.message || 'Unknown error'}`);
+    }
+  }
+
+  // 7. Return the predictable name
+  return secretName;
+}
+
+export async function waitForSecretReady(
+  $store: RancherStore,
+  clusterId: string,
+  namespace: string,
+  name: string,
+  timeoutMs = 20_000,
+  assumeReadyOn403_404 = true
+) {
+  const start = Date.now();
+  const url = `/k8s/clusters/${encodeURIComponent(clusterId)}/api/v1/namespaces/${encodeURIComponent(namespace)}/secrets/${encodeURIComponent(name)}`;
+
+  for (;;) {
+    try {
+      const r = await $store.dispatch('rancher/request', { url });
+      const s = (r?.data ?? r) || {};
+      const ok = s?.type === 'kubernetes.io/dockerconfigjson' &&
+                 typeof s?.data?.['.dockerconfigjson'] === 'string' &&
+                 s.data['.dockerconfigjson'].length > 0;
+      if (ok) return;
+    } catch (e: unknown) {
+      const code = statusOf(e);
+      if (assumeReadyOn403_404 && (code === 403 || code === 404)) {
+        log('secret readiness probe blocked by RBAC/404; assuming ready', { ns: namespace, name });
+        return;
+      }
+      // else: keep polling
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`Timed out waiting for secret ${namespace}/${name} to be readable`);
+    }
+    await new Promise(r => setTimeout(r, 700));
+  }
+}

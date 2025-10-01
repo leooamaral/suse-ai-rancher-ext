@@ -1,0 +1,38 @@
+/* Minimal SUSE-like accents */
+:root {
+  --suse-green: #73BA25;
+  --suse-green-2: #8FD24A;
+  --suse-ink-900: #0B1F2A;
+  --suse-ink-800: #0F2732;
+  --suse-card: #10242E;
+  --suse-border: #284C5E;
+  --suse-text: #E9F1F3;
+}
+
+.suse-ai-surface {
+  background: linear-gradient(180deg, var(--suse-ink-900), var(--suse-ink-800));
+  color: var(--suse-text);
+}
+
+.suse-tile {
+  background: var(--suse-card);
+  border: 1px solid var(--suse-border);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.suse-cta {
+  appearance: none;
+  border: 0;
+  border-radius: 10px;
+  background: var(--suse-green);
+  color: #0b2618;
+  padding: 8px 12px;
+  font-weight: 700;
+}
+
+.suse-cta.outline {
+  background: transparent !important;
+  color: var(--suse-green);
+  border: 1px solid var(--suse-green);
+}

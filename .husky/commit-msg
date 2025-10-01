@@ -1,0 +1,1 @@
+cd pkg/suseai-rancher-ext && npx --no -- commitlint --edit $1
