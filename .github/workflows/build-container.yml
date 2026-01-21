@@ -4,7 +4,7 @@ on: [push, pull_request, workflow_dispatch]
 
 env:
   CHART_PATH: charts/suse-ai-rancher-ext
-  CHART_REGISTRY: oci://ghcr.io/suse/chart
+  CHART_REGISTRY: oci://ghcr.io/leooamaral/chart
 
 jobs:
   build-extension:
@@ -72,7 +72,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.tags.outputs.TAGS }}
         run: |
-          publish=(yarn publish-pkgs -c -p -i '' -r ghcr.io -o 'suse')
+          publish=(yarn publish-pkgs -c -p -i '' -r ghcr.io -o 'leooamaral')
 
           if [[ -n "${{ env.RELEASE_TAG }}" ]]; then
             publish+=(-t "$RELEASE_TAG")
