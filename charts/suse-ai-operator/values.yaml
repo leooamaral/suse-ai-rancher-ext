@@ -1,0 +1,82 @@
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+manager:
+  replicas: 1
+  
+  image:
+    registry: ghcr.io
+    repository: suse/suse-ai-operator
+    tag: 0.1.0
+    pullPolicy: IfNotPresent
+
+  imagePullSecrets: []
+
+  args:
+    - --leader-elect
+
+  env: []
+
+  podAnnotations: {}
+
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+        type: RuntimeDefault
+
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+        drop:
+            - ALL
+    readOnlyRootFilesystem: true
+
+  resources:
+    limits:
+        cpu: 500m
+        memory: 128Mi
+    requests:
+        cpu: 10m
+        memory: 64Mi
+
+  probes:
+    liveness:
+      enabled: true
+      httpGet:
+        path: /healthz
+        port: 8081
+      periodSeconds: 20
+      initialDelaySeconds: 15
+    readiness:
+      enabled: true
+      httpGet:
+        path: /readyz
+        port: 8081
+      periodSeconds: 10
+      initialDelaySeconds: 5
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+rbacHelpers:
+  enable: false
+
+metrics:
+  enable: true
+  port: 8443
+
+extensions:
+  enabled: true
+  items:
+    - name: suse-ai-lifecycle-manager
+      version: "1.0.0"
+      helm:
+        name: suse-ai-lifecycle-manager
+        url: "ghcr.io/suse/chart/suse-ai-lifecycle-manager"
+        version: "1.0.0"
+        type: oci
