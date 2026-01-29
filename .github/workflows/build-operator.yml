@@ -3,9 +3,9 @@ name: Build and Publish SUSE AI Operator [Container and Helm Chart]
 on: [push, pull_request, workflow_dispatch]
 
 env:
-    CONTAINER_REGISTRY: ghcr.io/suse/suse-ai-operator
+    CONTAINER_REGISTRY: ghcr.io/leooamaral/suse-ai-operator
     CHART_PATH: chart/suse-ai-operator
-    CHART_REGISTRY: oci://ghcr.io/suse/chart
+    CHART_REGISTRY: oci://ghcr.io/leooamaral/chart
 jobs:
   container:
     if: ${{ github.event_name == 'push' && startsWith(github.ref_name, 'suse-ai-operator-') }}
