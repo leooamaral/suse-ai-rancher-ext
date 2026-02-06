@@ -8,9 +8,9 @@ on:
       - suse-ai-operator-*
 
 env:
-    CONTAINER_REGISTRY: ghcr.io/suse/suse-ai-operator
+    CONTAINER_REGISTRY: ghcr.io/leooamaral/suse-ai-operator
     CHART_PATH: charts/suse-ai-operator
-    CHART_REGISTRY: oci://ghcr.io/suse/chart
+    CHART_REGISTRY: oci://ghcr.io/leooamaral/chart
     VERSION_PATH: suse-ai-operator/VERSION
 jobs:
   container:
@@ -46,7 +46,7 @@ jobs:
 
               if [[ -z "$LAST_DEV" ]]; then
                 DEV_NUM=1
-                NOTES_START_TAG=$(git tag --list "suse-ai-operator-*" --sort=-v:refname | grep -v "\-dev" | head -n 1)
+                NOTES_START_TAG=$(git tag --list "suse-ai-operator-*" --sort=-v:refname | grep -v "\-dev" | head -n 1 || true)
               else
                 DEV_NUM="${LAST_DEV##*.}"
                 DEV_NUM=$((DEV_NUM + 1))
@@ -169,7 +169,7 @@ jobs:
         run: |
           yq -i '
             .annotations."helm.sh/images" =
-            "- image: ghcr.io/suse/suse-ai-operator:${{ needs.container.outputs.VERSION }}\n  name: suse-ai-operator"
+            "- image: ghcr.io/leooamaral/suse-ai-operator:${{ needs.container.outputs.VERSION }}\n  name: suse-ai-operator"
           ' $CHART_PATH/Chart.yaml
 
       - name: Package Helm Chart
