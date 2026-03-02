@@ -43,13 +43,13 @@ jobs:
               git fetch --tags
 
               LAST_DEV=$(git tag \
-                --list "suse-ai-operator-${BASE_VERSION}-dev.*" \
+                --list "suse-ai-lifecycle-manager-${BASE_VERSION}-dev.*" \
                 --sort=-v:refname \
                 | head -n 1)
 
               if [[ -z "$LAST_DEV" ]]; then
                 DEV_NUM=1
-                NOTES_START_TAG=$(git tag --list "suse-ai-operator-*" --sort=-v:refname | grep -v "\-dev" | head -n 1)
+                NOTES_START_TAG=$(git tag --list "suse-ai-lifecycle-manager-*" --sort=-v:refname | grep -v "\-dev" | head -n 1)
               else
                 DEV_NUM="${LAST_DEV##*.}"
                 DEV_NUM=$((DEV_NUM + 1))
@@ -68,8 +68,8 @@ jobs:
 
               PUBLISH=true
               ;;
-            refs/tags/suse-ai-operator-*)
-              VERSION="${ref#refs/tags/suse-ai-operator-}"
+            refs/tags/suse-ai-lifecycle-manager-*)
+              VERSION="${ref#refs/tags/suse-ai-lifecycle-manager-"
               IMAGE_TAGS="$VERSION"
               CHART_VERSION="$VERSION"
               NOTES_START_TAG=""
