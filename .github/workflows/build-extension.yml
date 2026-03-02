@@ -24,8 +24,13 @@ jobs:
       PUBLISH: ${{ steps.tags.outputs.PUBLISH }}
       METADATA_TAGS: ${{ steps.tags.outputs.METADATA_TAGS }}
       NOTES_START_TAG: ${{ steps.tags.outputs.NOTES_START_TAG }}
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
       - name: Calculate tags
         id: tags
         shell: bash
