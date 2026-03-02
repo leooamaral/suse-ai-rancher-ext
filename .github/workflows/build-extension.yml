@@ -69,7 +69,7 @@ jobs:
               PUBLISH=true
               ;;
             refs/tags/suse-ai-lifecycle-manager-*)
-              VERSION="${ref#refs/tags/suse-ai-lifecycle-manager-"
+              VERSION="${ref#refs/tags/suse-ai-lifecycle-manager-}"
               IMAGE_TAGS="$VERSION"
               CHART_VERSION="$VERSION"
               NOTES_START_TAG=""
