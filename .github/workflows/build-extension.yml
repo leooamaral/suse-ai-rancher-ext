@@ -214,7 +214,7 @@ jobs:
     runs-on: ubuntu-latest
     if: needs.prepare.outputs.PUBLISH == 'true'
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: Checkout repository
