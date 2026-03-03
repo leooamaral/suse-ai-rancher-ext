@@ -177,6 +177,15 @@ jobs:
       - name: Install dependencies
         run: yarn
 
+      - name: Sync package.json versions (dev only)
+        if: contains(env.RELEASE_TAG, '-dev.')
+        run: |
+          echo "Updating root package.json"
+          yarn --cwd . version --new-version "${{ needs.prepare.outputs.VERSION }}" --no-git-tag-version
+          
+          echo "Updating pkg/suse-ai-lifecycle-manager/package.json"
+          yarn --cwd pkg/suse-ai-lifecycle-manager version --new-version "${{ needs.prepare.outputs.VERSION }}" --no-git-tag-version
+
       - name: Parse Extension Name
         id: parsed-name
         env:
@@ -247,6 +256,15 @@ jobs:
             .annotations."helm.sh/images" =
             "- image: ghcr.io/suse/suse-ai-lifecycle-manager:${{ needs.prepare.outputs.VERSION }}\n  name: suse-ai-lifecycle-manager"
           ' $CHART_PATH/Chart.yaml
+
+      - name: Sync package.json versions (dev only)
+        if: contains(env.RELEASE_TAG, '-dev.')
+        run: |
+          echo "Updating root package.json"
+          yarn --cwd . version --new-version "${{ needs.prepare.outputs.VERSION }}" --no-git-tag-version
+          
+          echo "Updating pkg/suse-ai-lifecycle-manager/package.json"
+          yarn --cwd pkg/suse-ai-lifecycle-manager version --new-version "${{ needs.prepare.outputs.VERSION }}" --no-git-tag-version
 
       - name: Package Helm Chart
         id: package
